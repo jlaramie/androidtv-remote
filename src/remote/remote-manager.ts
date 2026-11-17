@@ -7,7 +7,7 @@ import type { Certificate } from "../types.js"
 
 interface RemoteResponse {
   remotePingRequest?: { val1: number }
-  remoteConfigure?: unknown
+  remoteConfigure?: { code1?: number }
   remoteSetActive?: unknown
   remoteImeKeyInject?: { appInfo: { appPackage: string } }
   remoteImeBatchEdit?: { imeCounter: number; fieldCounter: number }
@@ -42,6 +42,7 @@ const createRemoteManager = (
   host: string,
   port: number,
   certs: Certificate,
+  wantedFeatures: number = messages.DEFAULT_FEATURES,
 ): RemoteManager => {
   const emitter = new EventEmitter()
   let client: tls.TLSSocket | undefined
@@ -49,6 +50,8 @@ const createRemoteManager = (
   let imeCounter = 0
   let fieldCounter = 0
   let stopped = false
+  // What both sides support: the TV says what it offers in RemoteConfigure.code1 (androidtvremote2 does the same).
+  let activeFeatures = wantedFeatures
 
   const start = (): Promise<boolean> =>
     new Promise((resolve, reject) => {
@@ -89,10 +92,11 @@ const createRemoteManager = (
         }
 
         if (message.remoteConfigure) {
-          client?.write(messages.createRemoteConfigure())
+          activeFeatures = wantedFeatures & (message.remoteConfigure.code1 ?? 0)
+          client?.write(messages.createRemoteConfigure(activeFeatures))
           emitter.emit("ready")
         } else if (message.remoteSetActive) {
-          client?.write(messages.createRemoteSetActive(622))
+          client?.write(messages.createRemoteSetActive(activeFeatures))
         } else if (message.remotePingRequest) {
           client?.write(
             messages.createRemotePingResponse(message.remotePingRequest.val1),

@@ -25,10 +25,25 @@ const create = (payload: Record<string, unknown>): Uint8Array => {
   return array
 }
 
-const createRemoteConfigure = (): Uint8Array =>
+/** Remote-channel features, as bits of RemoteConfigure.code1 / RemoteSetActive.active. */
+const Feature = {
+  PING: 1 << 0,
+  KEY: 1 << 1,
+  IME: 1 << 2,
+  VOICE: 1 << 3,
+  POWER: 1 << 5,
+  VOLUME: 1 << 6,
+  APP_LINK: 1 << 9,
+} as const
+
+/** What this library asks for by default: keys, text input, voice, power, volume and app links (upstream's 622). */
+const DEFAULT_FEATURES =
+  Feature.KEY | Feature.IME | Feature.VOICE | Feature.POWER | Feature.VOLUME | Feature.APP_LINK
+
+const createRemoteConfigure = (features: number = DEFAULT_FEATURES): Uint8Array =>
   create({
     remoteConfigure: {
-      code1: 622,
+      code1: features,
       deviceInfo: {
         model: deviceInfo.model,
         vendor: deviceInfo.manufacturer,
@@ -78,6 +93,8 @@ const createRemoteAppLinkLaunchRequest = (appLink: string): Uint8Array =>
 const parse = (payload: Buffer): protobuf.Message => RemoteMessage.decode(payload)
 
 export {
+  Feature,
+  DEFAULT_FEATURES,
   RemoteKeyCode,
   RemoteDirection,
   createRemoteConfigure,

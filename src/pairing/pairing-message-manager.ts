@@ -51,7 +51,7 @@ const createPairingConfiguration = (): Uint8Array =>
     protocolVersion: 2,
   })
 
-const createPairingSecret = (secret: number[]): Uint8Array =>
+const createPairingSecret = (secret: Uint8Array): Uint8Array =>
   create({
     pairingSecret: { secret },
     status: Status.STATUS_OK,

@@ -1,8 +1,8 @@
 import tls from "node:tls"
-import { createHash } from "node:crypto"
 import EventEmitter from "node:events"
 import * as messages from "./pairing-message-manager.js"
 import { createFrameReader } from "../framing.js"
+import { pairingSecret, type RsaKey } from "./secret.js"
 import { log } from "../logger.js"
 import type { Certificate } from "../types.js"
 
@@ -37,20 +37,6 @@ const RETRYABLE_CONNECT_CODES = new Set([
 const MAX_CONNECT_ATTEMPTS = 5
 const RETRY_DELAY_MS = 1000
 
-// Signed-byte hex parse, ported verbatim from upstream. Both the code and the
-// digest run through this, so the >127 → negative conversion must stay exact.
-const hexStringToBytes = (q: string): number[] => {
-  const bytes: number[] = []
-  for (let i = 0; i < q.length; i += 2) {
-    let byte = parseInt(q.substring(i, i + 2), 16)
-    if (byte > 127) {
-      byte = -(~byte & 0xff) - 1
-    }
-    bytes.push(byte)
-  }
-  return bytes
-}
-
 const createPairingManager = (
   host: string,
   port: number,
@@ -61,33 +47,18 @@ const createPairingManager = (
   let client: tls.TLSSocket | undefined
 
   const sendCode = (code: string): boolean => {
-    log.debug("Sending code:", code)
-    const codeBytes = hexStringToBytes(code)
     if (!client) return false
-
-    // RSA cert details. Node types modulus/exponent as optional, but both are
-    // always present for the RSA certs used in pairing.
-    type RsaCertificate = { modulus: string; exponent: string }
-    const clientCertificate = client.getCertificate() as RsaCertificate
-    const serverCertificate =
-      client.getPeerCertificate() as unknown as RsaCertificate
-
-    // SHA-256 over both certs' moduli/exponents plus the user code. Ported from
-    // upstream's crypto-js to native node:crypto — identical byte segments,
-    // proven equivalent in test/digest.test.ts.
-    const sha256 = createHash("sha256")
-    sha256.update(Buffer.from(clientCertificate.modulus, "hex"))
-    sha256.update(Buffer.from("0" + clientCertificate.exponent.slice(2), "hex"))
-    sha256.update(Buffer.from(serverCertificate.modulus, "hex"))
-    sha256.update(Buffer.from("0" + serverCertificate.exponent.slice(2), "hex"))
-    sha256.update(Buffer.from(code.slice(2), "hex"))
-
-    const hashArray = hexStringToBytes(sha256.digest("hex"))
-    if (hashArray[0] !== codeBytes[0]) {
+    // Node types modulus/exponent as optional, but both are always present for the RSA certs used in pairing.
+    const secret = pairingSecret(
+      client.getCertificate() as unknown as RsaKey,
+      client.getPeerCertificate() as unknown as RsaKey,
+      code,
+    )
+    if (!secret) {
       client.destroy(new Error("Bad Code"))
       return false
     }
-    client.write(messages.createPairingSecret(hashArray))
+    client.write(messages.createPairingSecret(secret))
     return true
   }
 

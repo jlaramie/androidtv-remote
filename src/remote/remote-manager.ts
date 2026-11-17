@@ -31,7 +31,7 @@ interface RemoteResponse {
  * - `connecting`: a connection is being opened.
  * - `ready`: the TV configured the session; keys can be sent.
  * - `backoff`: the connection dropped; the next attempt waits (1 s, 2 s, 4 s … up to 60 s).
- * - `unpaired`: the TV refused our certificate; it no longer reconnects (pair again).
+ * - `unpaired`: the TV refused our certificate before configuring a session; it no longer reconnects (pair again).
  * - `stopped`: stop() was called.
  */
 type RemoteState = "connecting" | "ready" | "backoff" | "unpaired" | "stopped"
@@ -60,6 +60,14 @@ interface RemoteManagerOptions {
 }
 
 const DEFAULT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000] as const
+
+/**
+ * How a TV turns away a certificate it doesn't know: it resets the connection right after the handshake, or fails the
+ * handshake with a TLS alert. Only meaningful before the TV configured the session; a reset later (a TV rebooting) is
+ * an ordinary drop.
+ */
+const refusesCertificate = (error: NodeJS.ErrnoException | undefined): boolean =>
+  error?.code === "ECONNRESET" || /^ERR_SSL_|ALERT|CERT/.test(error?.code ?? "")
 
 const createRemoteManager = (
   host: string,
@@ -144,6 +152,7 @@ const createRemoteManager = (
       if (state === "stopped") return resolve(false)
       setState("connecting")
       let error: NodeJS.ErrnoException | undefined
+      let configured = false
       // See pairing-manager: `family` is forwarded to the socket but absent from tls.ConnectionOptions. Pin IPv4 so a
       // resolved hostname can't yield a scopeless IPv6 link-local address that never routes on the LAN.
       const tlsOptions: tls.ConnectionOptions & { family?: number } = {
@@ -167,7 +176,11 @@ const createRemoteManager = (
         log.debug(host + " Remote secureConnect")
         resolve(true)
       })
-      const frames = createFrameReader((payload) => handle(messages.parse(payload) as unknown as RemoteResponse))
+      const frames = createFrameReader((payload) => {
+        const message = messages.parse(payload) as unknown as RemoteResponse
+        if (message.remoteConfigure) configured = true
+        handle(message)
+      })
       socket.on("data", (data) => {
         try {
           frames.push(data)
@@ -184,7 +197,9 @@ const createRemoteManager = (
         if (client === socket) client = undefined
         reject(new Error(error?.code ?? "Remote connection closed"))
         if (state === "stopped") return
-        if (hasError && error?.code === "ECONNRESET") {
+        if (!configured && refusesCertificate(error)) {
+          // The TV no longer knows our certificate (reset, or the pairing removed there): retrying cannot help.
+          log.info(host + " The TV refused our certificate: pair again")
           setState("unpaired")
           emitter.emit("unpaired")
           return
@@ -217,5 +232,5 @@ const createRemoteManager = (
   }) as RemoteManager
 }
 
-export { createRemoteManager, DEFAULT_BACKOFF_MS }
+export { createRemoteManager, DEFAULT_BACKOFF_MS, refusesCertificate }
 export type { RemoteManager, RemoteManagerOptions, RemoteState }

@@ -34,6 +34,8 @@ export interface FakeRemoteTv {
   /** Every message the client sent, as JSON. */
   received: Json[]
   sockets: tls.TLSSocket[]
+  /** Resets connection `i` at the TCP level (RST), as a TV does when it drops a client. */
+  reset(i: number): void
   /** Sends a RemoteMessage to every connected client. */
   send(payload: object): void
   close(): Promise<void>
@@ -44,13 +46,14 @@ export async function fakeRemoteTv(
 ): Promise<FakeRemoteTv> {
   const received: Json[] = []
   const sockets: tls.TLSSocket[] = []
+  const raw: import("node:net").Socket[] = []
   const cert = tvCertificate()
   const server = tls.createServer(
     { key: cert.key, cert: cert.cert, requestCert: true, rejectUnauthorized: false },
     (sock) => {
       if (o.refuseCertificate) {
-        // What a TV does with a certificate it does not know: it drops the connection at once.
-        sock.resetAndDestroy()
+        // What a TV does with a certificate it does not know: it resets the connection at once.
+        raw.at(-1)?.resetAndDestroy()
         return
       }
       sockets.push(sock)
@@ -72,12 +75,15 @@ export async function fakeRemoteTv(
       )
     },
   )
+  // The TCP socket under each TLS one: only it can be reset.
+  server.on("connection", (s) => raw.push(s))
   server.listen(0, "127.0.0.1")
   await once(server, "listening")
   return {
     port: (server.address() as AddressInfo).port,
     received,
     sockets,
+    reset: (i) => raw[i]?.resetAndDestroy(),
     send: (payload) => {
       for (const s of sockets) if (!s.destroyed) s.write(encode(RemoteMessage, payload))
     },

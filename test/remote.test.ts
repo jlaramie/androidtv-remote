@@ -2,7 +2,7 @@ import test, { after } from "node:test"
 import assert from "node:assert/strict"
 import { once } from "node:events"
 import { generateCertificate } from "../src/certificate/certificate-generator.js"
-import { createRemoteManager } from "../src/remote/remote-manager.js"
+import { createRemoteManager, refusesCertificate } from "../src/remote/remote-manager.js"
 import { DEFAULT_FEATURES, Feature } from "../src/remote/remote-message-manager.js"
 import { createLogger } from "../src/logger.js"
 import { fakeRemoteTv } from "./fake-tv.js"
@@ -114,4 +114,41 @@ test("keys: sent only while ready; the TV's power report is kept", async () => {
   assert.equal(remote.sendPower(), true)
   await until(() => tv.received.some((m) => m.remoteKeyInject?.keyCode === "KEYCODE_POWER"))
   await until(() => remote.isOn === true)
+})
+
+test("re-pair: a TV that refuses our certificate says unpaired once, and is not retried", async () => {
+  const tv = await fakeRemoteTv({ refuseCertificate: true })
+  cleanups.push(() => tv.close())
+  const remote = createRemoteManager("127.0.0.1", tv.port, client, { backoffMs: [20] })
+  cleanups.push(() => remote.stop())
+  let unpaired = 0
+  remote.on("unpaired", () => unpaired++)
+  await remote.start().catch(() => false)
+  await until(() => remote.state === "unpaired")
+  await new Promise((r) => setTimeout(r, 200))
+  assert.equal(unpaired, 1)
+  assert.equal(remote.state, "unpaired")
+})
+
+test("re-pair: a reset after the session was configured (a TV rebooting) reconnects instead", async () => {
+  const tv = await fakeRemoteTv()
+  cleanups.push(() => tv.close())
+  const remote = createRemoteManager("127.0.0.1", tv.port, client, { backoffMs: [20] })
+  cleanups.push(() => remote.stop())
+  let unpaired = 0
+  remote.on("unpaired", () => unpaired++)
+  await remote.start()
+  await until(() => remote.state === "ready")
+  tv.reset(0)
+  await until(() => tv.sockets.length === 2 && remote.state === "ready")
+  assert.equal(unpaired, 0)
+})
+
+test("re-pair: TLS alerts count as a refused certificate, other errors do not", () => {
+  const e = (code: string) => Object.assign(new Error(code), { code })
+  assert.equal(refusesCertificate(e("ECONNRESET")), true)
+  assert.equal(refusesCertificate(e("ERR_SSL_SSLV3_ALERT_CERTIFICATE_UNKNOWN")), true)
+  assert.equal(refusesCertificate(e("ECONNREFUSED")), false)
+  assert.equal(refusesCertificate(e("EHOSTUNREACH")), false)
+  assert.equal(refusesCertificate(undefined), false)
 })

@@ -25,10 +25,11 @@ import type {
 interface AndroidRemote extends EventEmitter {
   start(): Promise<boolean>
   sendCode(code: string): boolean
-  sendPower(): void
-  sendKey(keyCode: number, direction?: number): void
-  sendAppLink(link: string): void
-  sendText(text: string): void
+  /** These return false, sending nothing, while the remote session is not ready. */
+  sendPower(): boolean
+  sendKey(keyCode: number, direction?: number): boolean
+  sendAppLink(link: string): boolean
+  sendText(text: string): boolean
   getCertificate(): Certificate
   stop(): void
   on<K extends keyof AndroidRemoteEvents>(
@@ -112,11 +113,10 @@ const createAndroidRemote = (
     pairing.finish(code).then(done, () => done("tv_refused"))
     return true
   }
-  const sendPower = (): void => remoteManager?.sendPower()
-  const sendKey = (keyCode: number, direction?: number): void =>
-    remoteManager?.sendKey(keyCode, direction)
-  const sendAppLink = (link: string): void => remoteManager?.sendAppLink(link)
-  const sendText = (text: string): void => remoteManager?.sendText(text)
+  const sendPower = (): boolean => remoteManager?.sendPower() ?? false
+  const sendKey = (keyCode: number, direction?: number): boolean => remoteManager?.sendKey(keyCode, direction) ?? false
+  const sendAppLink = (link: string): boolean => remoteManager?.sendAppLink(link) ?? false
+  const sendText = (text: string): boolean => remoteManager?.sendText(text) ?? false
   const getCertificate = (): Certificate => ({ key: cert.key, cert: cert.cert })
   const stop = (): void => {
     pairing?.cancel()

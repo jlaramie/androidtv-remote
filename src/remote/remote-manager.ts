@@ -27,24 +27,39 @@ interface RemoteResponse {
   toJSON(): unknown
 }
 
+/**
+ * - `connecting`: a connection is being opened.
+ * - `ready`: the TV configured the session; keys can be sent.
+ * - `backoff`: the connection dropped; the next attempt waits (1 s, 2 s, 4 s … up to 60 s).
+ * - `unpaired`: the TV refused our certificate; it no longer reconnects (pair again).
+ * - `stopped`: stop() was called.
+ */
+type RemoteState = "connecting" | "ready" | "backoff" | "unpaired" | "stopped"
+
 interface RemoteManager extends EventEmitter {
+  /** Connects, and keeps reconnecting until stop(). Resolves on the first TLS connection, rejects if it fails. */
   start(): Promise<boolean>
-  sendPower(): void
-  sendKey(keyCode: number, direction?: number): void
-  sendAppLink(link: string): void
-  sendText(text: string): void
+  readonly state: RemoteState
+  /** The TV's last reported power state on this session; undefined until it reports one. */
+  readonly isOn: boolean | undefined
+  sendPower(): boolean
+  /** Sends a key; false when the session is not ready (nothing is sent). */
+  sendKey(keyCode: number, direction?: number): boolean
+  sendAppLink(link: string): boolean
+  sendText(text: string): boolean
   stop(): void
 }
-
-const wait = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms))
 
 interface RemoteManagerOptions {
   /** The features to ask for; the TV's offer narrows them. Default 622 (messages.DEFAULT_FEATURES). */
   features?: number
   deviceInfo?: DeviceInfo
   log?: Logger
+  /** Reconnect delays, in ms, by consecutive failure; the last repeats. Default 1 s doubling to 60 s. */
+  backoffMs?: readonly number[]
 }
+
+const DEFAULT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000] as const
 
 const createRemoteManager = (
   host: string,
@@ -55,178 +70,152 @@ const createRemoteManager = (
   const wantedFeatures = options.features ?? messages.DEFAULT_FEATURES
   const deviceInfo = options.deviceInfo ?? defaultDeviceInfo()
   const log = options.log ?? defaultLog
+  const backoff = options.backoffMs?.length ? options.backoffMs : DEFAULT_BACKOFF_MS
   const emitter = new EventEmitter()
   let client: tls.TLSSocket | undefined
-  let error: NodeJS.ErrnoException | null = null
   let imeCounter = 0
   let fieldCounter = 0
-  let stopped = false
+  let state: RemoteState = "connecting"
+  let isOn: boolean | undefined
+  let failures = 0
+  let retryTimer: ReturnType<typeof setTimeout> | undefined
   // What both sides support: the TV says what it offers in RemoteConfigure.code1 (androidtvremote2 does the same).
   let activeFeatures = wantedFeatures
 
-  const start = (): Promise<boolean> =>
+  const setState = (next: RemoteState) => {
+    if (state === next) return
+    state = next
+    emitter.emit("state", next)
+  }
+
+  const write = (bytes: Uint8Array): boolean => {
+    if (state !== "ready" || !client || client.destroyed) return false
+    client.write(bytes)
+    return true
+  }
+
+  const handle = (message: RemoteResponse) => {
+    if (!message.remotePingRequest) log.debug(host + " Receive : " + JSON.stringify(message.toJSON()))
+    if (message.remoteConfigure) {
+      activeFeatures = wantedFeatures & (message.remoteConfigure.code1 ?? 0)
+      client?.write(messages.createRemoteConfigure(activeFeatures, deviceInfo))
+      failures = 0
+      setState("ready")
+      emitter.emit("ready")
+    } else if (message.remoteSetActive) {
+      client?.write(messages.createRemoteSetActive(activeFeatures))
+    } else if (message.remotePingRequest) {
+      client?.write(messages.createRemotePingResponse(message.remotePingRequest.val1))
+    } else if (message.remoteImeKeyInject) {
+      emitter.emit("current_app", message.remoteImeKeyInject.appInfo.appPackage)
+    } else if (message.remoteImeBatchEdit) {
+      imeCounter = message.remoteImeBatchEdit.imeCounter
+      fieldCounter = message.remoteImeBatchEdit.fieldCounter
+    } else if (message.remoteStart) {
+      isOn = message.remoteStart.started
+      emitter.emit("powered", message.remoteStart.started)
+    } else if (message.remoteSetVolumeLevel) {
+      emitter.emit("volume", {
+        level: message.remoteSetVolumeLevel.volumeLevel,
+        maximum: message.remoteSetVolumeLevel.volumeMax,
+        muted: message.remoteSetVolumeLevel.volumeMuted,
+      })
+    } else if (message.remoteError) {
+      emitter.emit("error", new Error("Remote error: " + JSON.stringify(message.remoteError)))
+    }
+    // IME show requests, voice and preferred-audio-device messages are not used.
+  }
+
+  const scheduleReconnect = () => {
+    if (state === "stopped" || state === "unpaired") return
+    const delay = backoff[Math.min(failures, backoff.length - 1)] as number
+    failures++
+    setState("backoff")
+    log.debug(`${host} reconnecting in ${delay} ms`)
+    retryTimer = setTimeout(() => {
+      retryTimer = undefined
+      connect().catch((e) => log.error(e))
+    }, delay)
+    retryTimer.unref?.()
+  }
+
+  const connect = (): Promise<boolean> =>
     new Promise((resolve, reject) => {
-      // See pairing-manager: `family` is forwarded to the socket but absent from
-      // tls.ConnectionOptions, so widen the type to accept it.
-      const options: tls.ConnectionOptions & { family?: number } = {
+      if (state === "stopped") return resolve(false)
+      setState("connecting")
+      let error: NodeJS.ErrnoException | undefined
+      // See pairing-manager: `family` is forwarded to the socket but absent from tls.ConnectionOptions. Pin IPv4 so a
+      // resolved hostname can't yield a scopeless IPv6 link-local address that never routes on the LAN.
+      const tlsOptions: tls.ConnectionOptions & { family?: number } = {
         key: certs.key,
         cert: certs.cert,
         port,
         host,
-        // Pin to IPv4 for the same reason as pairing: avoid a scopeless IPv6
-        // link-local from a resolved hostname that can never route on the LAN.
         family: 4,
         rejectUnauthorized: false,
       }
-
       log.debug("Start Remote Connect")
-      client = tls.connect(options, () => {})
-
-      client.on("timeout", () => {
-        log.debug("timeout")
-        client?.destroy()
+      const socket = tls.connect(tlsOptions)
+      client = socket
+      // The TV pings every ~5 s; 10 s without data means the link is dead.
+      socket.setTimeout(10_000)
+      socket.on("timeout", () => {
+        log.debug(host + " timeout")
+        socket.destroy()
       })
-
-      // The TV pings every ~5s; 10s without data means the link is dead.
-      client.setTimeout(10000)
-
-      client.on("secureConnect", () => {
+      socket.on("secureConnect", () => {
         log.debug(host + " Remote secureConnect")
         resolve(true)
       })
-
-      const frames = createFrameReader((payload) => {
-        const message = messages.parse(payload) as unknown as RemoteResponse
-
-        if (!message.remotePingRequest) {
-          log.debug(host + " Receive : " + JSON.stringify(message.toJSON()))
-        }
-
-        if (message.remoteConfigure) {
-          activeFeatures = wantedFeatures & (message.remoteConfigure.code1 ?? 0)
-          client?.write(messages.createRemoteConfigure(activeFeatures, deviceInfo))
-          emitter.emit("ready")
-        } else if (message.remoteSetActive) {
-          client?.write(messages.createRemoteSetActive(activeFeatures))
-        } else if (message.remotePingRequest) {
-          client?.write(
-            messages.createRemotePingResponse(message.remotePingRequest.val1),
-          )
-        } else if (message.remoteImeKeyInject) {
-          emitter.emit(
-            "current_app",
-            message.remoteImeKeyInject.appInfo.appPackage,
-          )
-        } else if (message.remoteImeBatchEdit) {
-          imeCounter = message.remoteImeBatchEdit.imeCounter
-          fieldCounter = message.remoteImeBatchEdit.fieldCounter
-        } else if (message.remoteImeShowRequest) {
-          log.debug("Receive IME SHOW REQUEST")
-        } else if (message.remoteVoiceBegin) {
-          // voice input not implemented
-        } else if (message.remoteVoicePayload) {
-          // voice input not implemented
-        } else if (message.remoteVoiceEnd) {
-          // voice input not implemented
-        } else if (message.remoteStart) {
-          emitter.emit("powered", message.remoteStart.started)
-        } else if (message.remoteSetVolumeLevel) {
-          emitter.emit("volume", {
-            level: message.remoteSetVolumeLevel.volumeLevel,
-            maximum: message.remoteSetVolumeLevel.volumeMax,
-            muted: message.remoteSetVolumeLevel.volumeMuted,
-          })
-        } else if (message.remoteSetPreferredAudioDevice) {
-          // ignored
-        } else if (message.remoteError) {
-          emitter.emit(
-            "error",
-            new Error("Remote error: " + JSON.stringify(message.remoteError)),
-          )
-        } else {
-          log.debug("What else ?")
-        }
-      })
-
-      client.on("data", (data) => {
+      const frames = createFrameReader((payload) => handle(messages.parse(payload) as unknown as RemoteResponse))
+      socket.on("data", (data) => {
         try {
           frames.push(data)
         } catch (err) {
-          client?.destroy(err as Error)
+          socket.destroy(err as Error)
         }
       })
-
-      client.on("close", async (hasError) => {
-        log.info(host + " Remote Connection closed ", hasError)
-        // An explicit stop() must not trigger the auto-reconnect ladder below.
-        if (stopped) return
-        if (hasError) {
-          reject(
-            new Error(error?.code ?? "Remote connection closed with error"),
-          )
-          if (error?.code === "ECONNRESET") {
-            emitter.emit("unpaired")
-          } else if (error?.code === "ECONNREFUSED") {
-            await wait(1000)
-            await start().catch((e) => log.error(e))
-          } else if (error?.code === "EHOSTDOWN") {
-            // device is off — do not reconnect
-          } else {
-            await wait(1000)
-            await start().catch((e) => log.error(e))
-          }
-        } else {
-          await wait(1000)
-          await start().catch((e) => log.error(e))
-        }
-      })
-
-      client.on("error", (err: NodeJS.ErrnoException) => {
+      socket.on("error", (err: NodeJS.ErrnoException) => {
         log.error(host, err)
         error = err
       })
+      socket.on("close", (hasError) => {
+        log.info(host + " Remote Connection closed ", hasError)
+        if (client === socket) client = undefined
+        reject(new Error(error?.code ?? "Remote connection closed"))
+        if (state === "stopped") return
+        if (hasError && error?.code === "ECONNRESET") {
+          setState("unpaired")
+          emitter.emit("unpaired")
+          return
+        }
+        scheduleReconnect()
+      })
     })
 
-  const sendPower = (): void => {
-    client?.write(
-      messages.createRemoteKeyInject(
-        messages.RemoteDirection.SHORT,
-        messages.RemoteKeyCode.KEYCODE_POWER,
-      ),
-    )
-  }
-
-  const sendKey = (
-    keyCode: number,
-    direction: number = messages.RemoteDirection.SHORT,
-  ): void => {
-    client?.write(messages.createRemoteKeyInject(direction, keyCode))
-  }
-
-  const sendAppLink = (link: string): void => {
-    client?.write(messages.createRemoteAppLinkLaunchRequest(link))
-  }
-
-  const sendText = (text: string): void => {
-    client?.write(
-      messages.createRemoteImeBatchEdit(imeCounter, fieldCounter, text),
-    )
-  }
-
   const stop = (): void => {
-    stopped = true
+    setState("stopped")
+    if (retryTimer) clearTimeout(retryTimer)
+    retryTimer = undefined
     client?.destroy()
   }
 
-  return Object.assign(emitter, {
-    start,
-    sendPower,
-    sendKey,
-    sendAppLink,
-    sendText,
-    stop,
+  // Getters must be defined, not assigned: Object.assign would copy their value once.
+  Object.defineProperties(emitter, {
+    state: { get: () => state, enumerable: true },
+    isOn: { get: () => isOn, enumerable: true },
   })
+  return Object.assign(emitter, {
+    start: connect,
+    sendPower: () =>
+      write(messages.createRemoteKeyInject(messages.RemoteDirection.SHORT, messages.RemoteKeyCode.KEYCODE_POWER)),
+    sendKey: (keyCode: number, direction: number = messages.RemoteDirection.SHORT) =>
+      write(messages.createRemoteKeyInject(direction, keyCode)),
+    sendAppLink: (link: string) => write(messages.createRemoteAppLinkLaunchRequest(link)),
+    sendText: (text: string) => write(messages.createRemoteImeBatchEdit(imeCounter, fieldCounter, text)),
+    stop,
+  }) as RemoteManager
 }
 
-export { createRemoteManager }
-export type { RemoteManager, RemoteManagerOptions }
+export { createRemoteManager, DEFAULT_BACKOFF_MS }
+export type { RemoteManager, RemoteManagerOptions, RemoteState }

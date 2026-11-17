@@ -70,3 +70,48 @@ test("instances: two remotes in one process keep their own identity and debug se
   await until(() => tvB.received.filter((m) => m.remoteSetActive).length >= 2)
   assert.deepEqual(lines, [])
 })
+
+test("reconnect: a dropped session comes back after a back-off, which resets once connected; stop() cancels it", async () => {
+  const tv = await fakeRemoteTv()
+  cleanups.push(() => tv.close())
+  const remote = createRemoteManager("127.0.0.1", tv.port, client, { backoffMs: [50, 400] })
+  cleanups.push(() => remote.stop())
+  const states: string[] = []
+  remote.on("state", (s) => states.push(s))
+  await remote.start()
+  await until(() => remote.state === "ready")
+  await until(() => remote.isOn === true)
+
+  // Clean close by the TV: the first retry waits 50 ms.
+  tv.sockets[0]?.end()
+  await until(() => tv.sockets.length === 2 && remote.state === "ready")
+  assert.deepEqual(states.slice(0, 4), ["ready", "backoff", "connecting", "ready"])
+
+  // Connected again, so the next drop starts over at 50 ms rather than 400 ms.
+  const t0 = Date.now()
+  tv.sockets[1]?.end()
+  await until(() => tv.sockets.length === 3 && remote.state === "ready")
+  assert.ok(Date.now() - t0 < 350, `reconnected after ${Date.now() - t0} ms`)
+
+  // A pending reconnect is cancelled by stop().
+  tv.sockets[2]?.end()
+  await until(() => remote.state === "backoff")
+  remote.stop()
+  await new Promise((r) => setTimeout(r, 150))
+  assert.equal(tv.sockets.length, 3)
+  assert.equal(remote.state, "stopped")
+  assert.equal(remote.sendPower(), false)
+})
+
+test("keys: sent only while ready; the TV's power report is kept", async () => {
+  const tv = await fakeRemoteTv({ started: false })
+  cleanups.push(() => tv.close())
+  const remote = createRemoteManager("127.0.0.1", tv.port, client)
+  cleanups.push(() => remote.stop())
+  assert.equal(remote.sendKey(85), false)
+  await remote.start()
+  await until(() => remote.isOn === false)
+  assert.equal(remote.sendPower(), true)
+  await until(() => tv.received.some((m) => m.remoteKeyInject?.keyCode === "KEYCODE_POWER"))
+  await until(() => remote.isOn === true)
+})

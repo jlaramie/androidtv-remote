@@ -2,7 +2,7 @@
 
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white)
 ![Node.js](https://img.shields.io/badge/Node.js-339933?style=flat-square&logo=node.js&logoColor=white)
-![npm](https://img.shields.io/npm/v/@kud/androidtv-remote?style=flat-square&color=CB3837)
+![npm](https://img.shields.io/npm/v/@jlaramie/androidtv-remote?style=flat-square&color=CB3837)
 ![MIT](https://img.shields.io/badge/licence-MIT-22C55E?style=flat-square)
 
 **Control Android TV / Google TV devices over the Android TV Remote v2 protocol**
@@ -12,6 +12,45 @@
 </div>
 
 A modern TypeScript/ESM implementation of the Android TV Remote v2 protocol — pair with a device over TLS, then send keys, launch apps, and inject text directly from Node.
+
+## About this fork
+
+`@jlaramie/androidtv-remote` is a fork of [`@kud/androidtv-remote`](https://github.com/kud/androidtv-remote) 0.1.2 by
+Erwann Mest (MIT), made for a home server that pairs Google TVs from a web page. It fixes these problems, each with
+tests against a fake TLS TV (`test/fake-tv.ts`):
+
+* **Messages over 127 bytes, split reads and several messages in one read stalled the connection.** A varint frame
+  reader now handles all three (louis49/androidtv-remote#21).
+* **Features were always 622.** The reply is now what we ask for ANDed with what the TV offers.
+* **The pairing hash assumed an odd-length exponent.** The RSA modulus and exponent are hashed as unsigned big-endian
+  bytes, as the TV does.
+* **Pairing had no timeout and one boolean for every outcome.** `startPairing()` resolves when the TV shows its code;
+  `session.finish(code)` resolves `paired`, `wrong_code` or `tv_refused`; both time out and take an `AbortSignal`.
+* **Two remotes in one process shared their identity and debug flag.** Each now has its own.
+* **Reconnects were a fixed 1 s retry that `stop()` could not cancel**, and an `EHOSTDOWN` stopped them for good. They
+  back off 1 s doubling to 60 s.
+* **Any connection reset meant "unpaired".** Now only a TV that refuses our certificate before configuring a session
+  does; a TV rebooting just reconnects.
+* **No way to use a stored certificate without the pairing flow.** `createRemote(host, { cert })` opens a remote
+  session with `state` and `isOn`; key sends say whether they were sent.
+
+`createAndroidRemote()` keeps working as before. [CHANGELOG.md](CHANGELOG.md) lists the details.
+
+### Pair from a server, control later
+
+```js
+import { createRemote, RemoteKeyCode, startPairing } from "@jlaramie/androidtv-remote"
+
+const session = await startPairing("192.168.1.42", { serviceName: "My app" }) // the TV shows a code
+const result = await session.finish(codeTheUserTyped) // "paired" | "wrong_code" | "tv_refused"
+if (result === "paired") store(session.certificate) // keep it: the TV pairs with this certificate
+
+const remote = createRemote("192.168.1.42", { cert: storedCertificate })
+void remote.start() // keeps the session up until remote.stop()
+remote.on("powered", (on) => console.log("TV is", on ? "on" : "off"))
+if (remote.state === "ready" && remote.isOn === false) remote.sendPower()
+remote.sendKey(RemoteKeyCode.KEYCODE_MEDIA_PAUSE)
+```
 
 ## 🌟 Features
 
@@ -26,13 +65,13 @@ A modern TypeScript/ESM implementation of the Android TV Remote v2 protocol — 
 ## 🚀 Quick Start
 
 ```sh
-npm install @kud/androidtv-remote
+npm install @jlaramie/androidtv-remote
 ```
 
 ### Pair a new device
 
 ```js
-import { createAndroidRemote } from "@kud/androidtv-remote"
+import { createAndroidRemote } from "@jlaramie/androidtv-remote"
 
 const remote = createAndroidRemote("192.168.1.42")
 
@@ -55,7 +94,7 @@ const cert = remote.getCertificate()
 ### Reconnect with a saved certificate
 
 ```js
-import { createAndroidRemote } from "@kud/androidtv-remote"
+import { createAndroidRemote } from "@jlaramie/androidtv-remote"
 
 const remote = createAndroidRemote("192.168.1.42", {
   cert: { key: savedKey, cert: savedCert },
@@ -75,7 +114,7 @@ await remote.start()
 Factory function that returns an `AndroidRemote` instance — an `EventEmitter` extended with control methods.
 
 ```ts
-import { createAndroidRemote } from "@kud/androidtv-remote"
+import { createAndroidRemote } from "@jlaramie/androidtv-remote"
 
 const remote = createAndroidRemote("192.168.1.42", options)
 ```
@@ -122,7 +161,7 @@ const remote = createAndroidRemote("192.168.1.42", options)
 An enum of Android key codes. Common entries:
 
 ```ts
-import { RemoteKeyCode } from "@kud/androidtv-remote"
+import { RemoteKeyCode } from "@jlaramie/androidtv-remote"
 
 remote.sendKey(RemoteKeyCode.KEYCODE_HOME)
 remote.sendKey(RemoteKeyCode.KEYCODE_BACK)
@@ -136,7 +175,7 @@ remote.sendKey(RemoteKeyCode.KEYCODE_VOLUME_UP)
 Direction constants for `sendKey()` — defaults to `SHORT` (a normal press). Use `START_LONG` / `END_LONG` to bracket a long press:
 
 ```ts
-import { RemoteKeyCode, RemoteDirection } from "@kud/androidtv-remote"
+import { RemoteKeyCode, RemoteDirection } from "@jlaramie/androidtv-remote"
 
 remote.sendKey(RemoteKeyCode.KEYCODE_DPAD_UP) // SHORT by default
 remote.sendKey(RemoteKeyCode.KEYCODE_DPAD_DOWN, RemoteDirection.START_LONG)
@@ -148,7 +187,7 @@ remote.sendKey(RemoteKeyCode.KEYCODE_DPAD_DOWN, RemoteDirection.END_LONG)
 Enable or disable verbose logging globally (affects all instances):
 
 ```ts
-import { setDebug } from "@kud/androidtv-remote"
+import { setDebug } from "@jlaramie/androidtv-remote"
 
 setDebug(true)
 ```

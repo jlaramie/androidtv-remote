@@ -1,8 +1,8 @@
 {
-  "name": "@kud/androidtv-remote",
-  "version": "0.1.2",
+  "name": "@jlaramie/androidtv-remote",
+  "version": "0.2.0-rc.0",
   "type": "module",
-  "description": "Control Android TV / Google TV devices over the Android TV Remote v2 protocol",
+  "description": "Control Android TV / Google TV devices over the Android TV Remote v2 protocol (maintained fork of @kud/androidtv-remote)",
   "keywords": [
     "android-tv",
     "google-tv",
@@ -15,11 +15,11 @@
   "author": "Erwann Mest <m@kud.io>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kud/androidtv-remote.git"
+    "url": "git+https://github.com/jlaramie/androidtv-remote.git"
   },
-  "homepage": "https://kud.io/projects/androidtv-remote",
+  "homepage": "https://github.com/jlaramie/androidtv-remote#readme",
   "bugs": {
-    "url": "https://github.com/kud/androidtv-remote/issues"
+    "url": "https://github.com/jlaramie/androidtv-remote/issues"
   },
   "exports": {
     ".": {
@@ -56,5 +56,8 @@
   },
   "engines": {
     "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

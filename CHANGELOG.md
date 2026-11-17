@@ -4,6 +4,37 @@ All notable changes to this project are documented here.
 
 ---
 
+## v0.2.0-rc.0 (@jlaramie/androidtv-remote)
+
+First release of the fork, published as `@jlaramie/androidtv-remote`.
+
+### Fixes
+
+- Framing: varint length prefixes are read properly, across and within TCP reads, so messages over 127 bytes, split
+  reads and coalesced reads no longer stall a connection (louis49/androidtv-remote#21).
+- Remote: features are negotiated with the TV (ours ANDed with its `RemoteConfigure.code1`) instead of always 622.
+- Pairing: the secret hashes the RSA modulus and exponent as unsigned big-endian bytes, so any exponent works.
+- Device info and debug logging are per instance.
+- Remote: reconnects back off from 1 s to 60 s, reset once connected, and `stop()` cancels a pending one. A TV that
+  went off the network is retried instead of given up on.
+- Remote: "unpaired" now means the TV refused our certificate before configuring a session; a reset after that (a
+  reboot) reconnects.
+
+### Features
+
+- `startPairing(host, options)` and `PairingSession.finish(code)` / `cancel()`, with timeouts, abort signals and
+  explicit results (`paired`, `wrong_code`, `tv_refused`; `PairingError` reasons `unreachable`, `refused`, `timeout`,
+  `cancelled`).
+- `createRemote(host, { cert })`: a remote session for an already paired TV, with `state`, `isOn` and a `state` event.
+- `generateCertificate` is exported.
+
+### Changes
+
+- `sendPower`, `sendKey`, `sendAppLink` and `sendText` return whether anything was sent (false while not ready).
+- `createAndroidRemote`'s `sendCode()` returns true once the code is sent; `start()` then resolves with the outcome.
+
+---
+
 ## v0.1.2 - 2026-07-10
 
 ### Fixes

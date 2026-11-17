@@ -34,7 +34,11 @@ tests against a fake TLS TV (`test/fake-tv.ts`):
 * **No way to use a stored certificate without the pairing flow.** `createRemote(host, { cert })` opens a remote
   session with `state` and `isOn`; key sends say whether they were sent.
 
-`createAndroidRemote()` keeps working as before. [CHANGELOG.md](CHANGELOG.md) lists the details.
+`createAndroidRemote()` keeps working as before.
+
+**Bundling:** the library loads its two `.proto` schemas from its own folder at run time. When you bundle it into one
+file, copy `@jlaramie/androidtv-remote/pairingmessage.proto` and `@jlaramie/androidtv-remote/remotemessage.proto`
+(both exported) next to the bundle. [CHANGELOG.md](CHANGELOG.md) lists the details.
 
 ### Pair from a server, control later
 

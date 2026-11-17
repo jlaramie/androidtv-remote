@@ -8,7 +8,11 @@ import {
   type PairingResult,
   type PairingErrorReason,
 } from "./pairing/pairing-manager.js"
-import { createRemoteManager } from "./remote/remote-manager.js"
+import {
+  createRemoteManager,
+  type RemoteManager,
+  type RemoteState,
+} from "./remote/remote-manager.js"
 import {
   RemoteKeyCode,
   RemoteDirection,
@@ -135,8 +139,46 @@ const createAndroidRemote = (
   }) as AndroidRemote
 }
 
-export { createAndroidRemote, setDebug, RemoteKeyCode, RemoteDirection, startPairing, PairingError }
+interface RemoteOptions {
+  /** The certificate the TV accepted at pairing (startPairing's session.certificate). */
+  cert: Certificate
+  /** Default 6466. */
+  port?: number
+  /** The features to ask for; the TV's offer narrows them. */
+  features?: number
+  manufacturer?: string
+  model?: string
+  debug?: boolean
+  /** Reconnect delays in ms; the last repeats. Default 1 s doubling to 60 s. */
+  backoffMs?: readonly number[]
+}
+
+/**
+ * A remote-control session with an already paired TV, kept connected (with back-off) until stop(). Call start() to
+ * connect; watch `state` ("ready" to send, "unpaired" to pair again) and `isOn`, or the events.
+ */
+const createRemote = (host: string, options: RemoteOptions): RemoteManager =>
+  createRemoteManager(host, options.port ?? 6466, options.cert, {
+    ...(options.features !== undefined ? { features: options.features } : {}),
+    deviceInfo: deviceInfoFrom({ manufacturer: options.manufacturer, model: options.model }),
+    log: createLogger(options.debug),
+    ...(options.backoffMs ? { backoffMs: options.backoffMs } : {}),
+  })
+
+export {
+  createAndroidRemote,
+  createRemote,
+  generateCertificate,
+  setDebug,
+  RemoteKeyCode,
+  RemoteDirection,
+  startPairing,
+  PairingError,
+}
 export type {
+  RemoteManager as Remote,
+  RemoteOptions,
+  RemoteState,
   PairingSession,
   PairingOptions,
   PairingResult,

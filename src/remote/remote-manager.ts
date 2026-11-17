@@ -2,7 +2,8 @@ import tls from "node:tls"
 import EventEmitter from "node:events"
 import * as messages from "./remote-message-manager.js"
 import { createFrameReader } from "../framing.js"
-import { log } from "../logger.js"
+import { log as defaultLog, type Logger } from "../logger.js"
+import { defaultDeviceInfo, type DeviceInfo } from "../device-info.js"
 import type { Certificate } from "../types.js"
 
 interface RemoteResponse {
@@ -38,12 +39,22 @@ interface RemoteManager extends EventEmitter {
 const wait = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms))
 
+interface RemoteManagerOptions {
+  /** The features to ask for; the TV's offer narrows them. Default 622 (messages.DEFAULT_FEATURES). */
+  features?: number
+  deviceInfo?: DeviceInfo
+  log?: Logger
+}
+
 const createRemoteManager = (
   host: string,
   port: number,
   certs: Certificate,
-  wantedFeatures: number = messages.DEFAULT_FEATURES,
+  options: RemoteManagerOptions = {},
 ): RemoteManager => {
+  const wantedFeatures = options.features ?? messages.DEFAULT_FEATURES
+  const deviceInfo = options.deviceInfo ?? defaultDeviceInfo()
+  const log = options.log ?? defaultLog
   const emitter = new EventEmitter()
   let client: tls.TLSSocket | undefined
   let error: NodeJS.ErrnoException | null = null
@@ -93,7 +104,7 @@ const createRemoteManager = (
 
         if (message.remoteConfigure) {
           activeFeatures = wantedFeatures & (message.remoteConfigure.code1 ?? 0)
-          client?.write(messages.createRemoteConfigure(activeFeatures))
+          client?.write(messages.createRemoteConfigure(activeFeatures, deviceInfo))
           emitter.emit("ready")
         } else if (message.remoteSetActive) {
           client?.write(messages.createRemoteSetActive(activeFeatures))
@@ -218,4 +229,4 @@ const createRemoteManager = (
 }
 
 export { createRemoteManager }
-export type { RemoteManager }
+export type { RemoteManager, RemoteManagerOptions }

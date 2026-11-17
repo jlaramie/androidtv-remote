@@ -1,8 +1,7 @@
 import protobuf from "protobufjs"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
-import { deviceInfo } from "../device-info.js"
-import { log } from "../logger.js"
+import { defaultDeviceInfo, type DeviceInfo } from "../device-info.js"
 
 const directory = dirname(fileURLToPath(import.meta.url))
 const root = protobuf.loadSync(join(directory, "remotemessage.proto"))
@@ -12,17 +11,10 @@ const RemoteKeyCode = root.lookupEnum("remote.RemoteKeyCode").values
 const RemoteDirection = root.lookupEnum("remote.RemoteDirection").values
 
 const create = (payload: Record<string, unknown>): Uint8Array => {
-  if (!payload.remotePingResponse) {
-    log.debug("Create Remote " + JSON.stringify(payload))
-  }
   const errMsg = RemoteMessage.verify(payload)
   if (errMsg) throw new Error(errMsg)
   const message = RemoteMessage.create(payload)
-  const array = RemoteMessage.encodeDelimited(message).finish()
-  if (!payload.remotePingResponse) {
-    log.debug("Sending " + JSON.stringify(message.toJSON()))
-  }
-  return array
+  return RemoteMessage.encodeDelimited(message).finish()
 }
 
 /** Remote-channel features, as bits of RemoteConfigure.code1 / RemoteSetActive.active. */
@@ -40,7 +32,10 @@ const Feature = {
 const DEFAULT_FEATURES =
   Feature.KEY | Feature.IME | Feature.VOICE | Feature.POWER | Feature.VOLUME | Feature.APP_LINK
 
-const createRemoteConfigure = (features: number = DEFAULT_FEATURES): Uint8Array =>
+const createRemoteConfigure = (
+  features: number = DEFAULT_FEATURES,
+  deviceInfo: DeviceInfo = defaultDeviceInfo(),
+): Uint8Array =>
   create({
     remoteConfigure: {
       code1: features,

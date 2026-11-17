@@ -3,7 +3,7 @@ import * as messages from "./pairing-message-manager.js"
 import { createFrameReader } from "../framing.js"
 import { generateCertificate } from "../certificate/certificate-generator.js"
 import { pairingSecret, type RsaKey } from "./secret.js"
-import { log } from "../logger.js"
+import { log as defaultLog, type Logger } from "../logger.js"
 import type { Certificate } from "../types.js"
 
 interface PairingResponse {
@@ -44,6 +44,8 @@ interface PairingOptions {
   /** Until the TV shows its code. Default 10 s. */
   timeoutMs?: number
   signal?: AbortSignal
+  /** This pairing's logger (default: the process-wide one, off unless setDebug(true)). */
+  logger?: Logger
 }
 
 /** A pairing in progress: the TV is showing its code. */
@@ -89,6 +91,7 @@ const connectForCode = (
   certificate: Certificate,
   o: { port: number; serviceName: string; clientName: string | undefined },
   onSocket: (s: tls.TLSSocket) => void,
+  log: Logger,
 ) =>
   new Promise<Connected>((resolve, reject) => {
     let secure = false
@@ -190,6 +193,7 @@ const bounded = <T>(p: Promise<T>, ms: number, signal: AbortSignal | undefined, 
  * `unreachable` (no connection, after riding out a dozing TV's transient errors), `refused`, `timeout` or `cancelled`.
  */
 const startPairing = async (host: string, options: PairingOptions = {}): Promise<PairingSession> => {
+  const log = options.logger ?? defaultLog
   const certificate =
     options.cert?.cert && options.cert.key
       ? { cert: options.cert.cert, key: options.cert.key }
@@ -204,7 +208,7 @@ const startPairing = async (host: string, options: PairingOptions = {}): Promise
   const attempt = async (): Promise<Connected> => {
     for (let n = 1; ; n++) {
       try {
-        return await connectForCode(host, certificate, o, (s) => (current = s))
+        return await connectForCode(host, certificate, o, (s) => (current = s), log)
       } catch (error) {
         const { retryable } = error as { retryable?: boolean }
         if (!retryable || n >= MAX_CONNECT_ATTEMPTS || givenUp) throw error

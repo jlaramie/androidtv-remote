@@ -19,4 +19,23 @@ const log = {
   },
 }
 
-export { log, setDebug }
+interface Logger {
+  debug(...args: unknown[]): void
+  info(...args: unknown[]): void
+  error(...args: unknown[]): void
+}
+
+/**
+ * A logger for one remote: on or off by its own `debug` option. Without one it follows the process-wide setDebug(), so
+ * a CLI's --debug still reaches every remote that did not choose for itself.
+ */
+const createLogger = (debug?: boolean): Logger => {
+  if (debug === undefined) return log
+  const on = (fn: (...a: unknown[]) => void) => (...args: unknown[]) => {
+    if (debug) fn(...args)
+  }
+  return { debug: on(console.debug), info: on(console.info), error: on(console.error) }
+}
+
+export { log, setDebug, createLogger }
+export type { Logger }

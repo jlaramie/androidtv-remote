@@ -13,8 +13,8 @@ import {
   RemoteKeyCode,
   RemoteDirection,
 } from "./remote/remote-message-manager.js"
-import { setDeviceInfo } from "./device-info.js"
-import { setDebug, log } from "./logger.js"
+import { deviceInfoFrom } from "./device-info.js"
+import { setDebug, createLogger } from "./logger.js"
 import type {
   AndroidRemoteOptions,
   AndroidRemoteEvents,
@@ -53,10 +53,10 @@ const createAndroidRemote = (
   host: string,
   options: AndroidRemoteOptions = {},
 ): AndroidRemote => {
-  // Only touch the global debug flag when explicitly set, so a process-wide
-  // setDebug(true) (e.g. a CLI --debug flag) isn't clobbered per instance.
-  if (options.debug !== undefined) setDebug(options.debug)
-  setDeviceInfo({ manufacturer: options.manufacturer, model: options.model })
+  // Per instance: one remote's debug option or identity never changes another's. Without `debug`, the process-wide
+  // setDebug() applies.
+  const log = createLogger(options.debug)
+  const deviceInfo = deviceInfoFrom({ manufacturer: options.manufacturer, model: options.model })
 
   const emitter = new EventEmitter()
   const pairingPort = options.pairing_port ?? 6467
@@ -75,7 +75,14 @@ const createAndroidRemote = (
     if (!cert.key || !cert.cert) {
       cert = generateCertificate(serviceName, "CNT", "ST", "LOC", "O", "OU")
       try {
-        pairing = await startPairing(host, { cert, port: pairingPort, serviceName, timeoutMs: 30_000 })
+        pairing = await startPairing(host, {
+          cert,
+          port: pairingPort,
+          serviceName,
+          clientName: deviceInfo.model,
+          timeoutMs: 30_000,
+          logger: log,
+        })
       } catch (error) {
         log.error(error)
         return false
@@ -85,7 +92,7 @@ const createAndroidRemote = (
       if ((await result) !== "paired") return false
     }
 
-    remoteManager = createRemoteManager(host, remotePort, cert)
+    remoteManager = createRemoteManager(host, remotePort, cert, { deviceInfo, log })
     remoteManager.on("powered", (powered) => emitter.emit("powered", powered))
     remoteManager.on("volume", (volume) => emitter.emit("volume", volume))
     remoteManager.on("current_app", (app) => emitter.emit("current_app", app))

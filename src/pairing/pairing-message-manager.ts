@@ -1,7 +1,7 @@
 import protobuf from "protobufjs"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
-import { deviceInfo } from "../device-info.js"
+import { defaultDeviceInfo } from "../device-info.js"
 
 const directory = dirname(fileURLToPath(import.meta.url))
 const root = protobuf.loadSync(join(directory, "pairingmessage.proto"))
@@ -19,7 +19,7 @@ const create = (payload: object): Uint8Array => {
   return PairingMessage.encodeDelimited(PairingMessage.create(payload)).finish()
 }
 
-const createPairingRequest = (serviceName: string, clientName: string = deviceInfo.model): Uint8Array =>
+const createPairingRequest = (serviceName: string, clientName: string = defaultDeviceInfo().model): Uint8Array =>
   create({
     pairingRequest: { serviceName, clientName },
     status: Status.STATUS_OK,

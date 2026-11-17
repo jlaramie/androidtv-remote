@@ -19,9 +19,9 @@ const create = (payload: object): Uint8Array => {
   return PairingMessage.encodeDelimited(PairingMessage.create(payload)).finish()
 }
 
-const createPairingRequest = (serviceName: string): Uint8Array =>
+const createPairingRequest = (serviceName: string, clientName: string = deviceInfo.model): Uint8Array =>
   create({
-    pairingRequest: { serviceName, clientName: deviceInfo.model },
+    pairingRequest: { serviceName, clientName },
     status: Status.STATUS_OK,
     protocolVersion: 2,
   })

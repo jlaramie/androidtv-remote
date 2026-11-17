@@ -1,6 +1,13 @@
 import EventEmitter from "node:events"
 import { generateCertificate } from "./certificate/certificate-generator.js"
-import { createPairingManager } from "./pairing/pairing-manager.js"
+import {
+  startPairing,
+  PairingError,
+  type PairingSession,
+  type PairingOptions,
+  type PairingResult,
+  type PairingErrorReason,
+} from "./pairing/pairing-manager.js"
 import { createRemoteManager } from "./remote/remote-manager.js"
 import {
   RemoteKeyCode,
@@ -60,24 +67,22 @@ const createAndroidRemote = (
     cert: options.cert?.cert ?? "",
   }
 
-  let pairingManager: ReturnType<typeof createPairingManager> | undefined
+  let pairing: PairingSession | undefined
+  let codeResult: ((r: PairingResult) => void) | undefined
   let remoteManager: ReturnType<typeof createRemoteManager> | undefined
 
   const start = async (): Promise<boolean> => {
     if (!cert.key || !cert.cert) {
       cert = generateCertificate(serviceName, "CNT", "ST", "LOC", "O", "OU")
-      pairingManager = createPairingManager(
-        host,
-        pairingPort,
-        cert,
-        serviceName,
-      )
-      pairingManager.on("secret", () => emitter.emit("secret"))
-      const paired = await pairingManager.start().catch((error) => {
+      try {
+        pairing = await startPairing(host, { cert, port: pairingPort, serviceName, timeoutMs: 30_000 })
+      } catch (error) {
         log.error(error)
         return false
-      })
-      if (!paired) return false
+      }
+      const result = new Promise<PairingResult>((resolve) => (codeResult = resolve))
+      emitter.emit("secret")
+      if ((await result) !== "paired") return false
     }
 
     remoteManager = createRemoteManager(host, remotePort, cert)
@@ -93,8 +98,13 @@ const createAndroidRemote = (
     return remoteManager.start().catch(() => false)
   }
 
-  const sendCode = (code: string): boolean =>
-    pairingManager?.sendCode(code) ?? false
+  /** Sends the code the TV shows; `start()` then resolves with whether pairing (and the remote) succeeded. */
+  const sendCode = (code: string): boolean => {
+    if (!pairing || !codeResult) return false
+    const done = codeResult
+    pairing.finish(code).then(done, () => done("tv_refused"))
+    return true
+  }
   const sendPower = (): void => remoteManager?.sendPower()
   const sendKey = (keyCode: number, direction?: number): void =>
     remoteManager?.sendKey(keyCode, direction)
@@ -102,7 +112,7 @@ const createAndroidRemote = (
   const sendText = (text: string): void => remoteManager?.sendText(text)
   const getCertificate = (): Certificate => ({ key: cert.key, cert: cert.cert })
   const stop = (): void => {
-    pairingManager?.stop()
+    pairing?.cancel()
     remoteManager?.stop()
   }
 
@@ -118,8 +128,12 @@ const createAndroidRemote = (
   }) as AndroidRemote
 }
 
-export { createAndroidRemote, setDebug, RemoteKeyCode, RemoteDirection }
+export { createAndroidRemote, setDebug, RemoteKeyCode, RemoteDirection, startPairing, PairingError }
 export type {
+  PairingSession,
+  PairingOptions,
+  PairingResult,
+  PairingErrorReason,
   AndroidRemote,
   AndroidRemoteOptions,
   AndroidRemoteEvents,

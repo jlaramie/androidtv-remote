@@ -1,7 +1,7 @@
 import tls from "node:tls"
-import EventEmitter from "node:events"
 import * as messages from "./pairing-message-manager.js"
 import { createFrameReader } from "../framing.js"
+import { generateCertificate } from "../certificate/certificate-generator.js"
 import { pairingSecret, type RsaKey } from "./secret.js"
 import { log } from "../logger.js"
 import type { Certificate } from "../types.js"
@@ -15,164 +15,247 @@ interface PairingResponse {
   toJSON(): unknown
 }
 
-interface PairingManager extends EventEmitter {
-  start(): Promise<boolean>
-  sendCode(code: string): boolean
-  stop(): void
+/** How a code ended: accepted, rejected (start again for a new code), or refused by the TV for another reason. */
+type PairingResult = "paired" | "wrong_code" | "tv_refused"
+
+type PairingErrorReason = "unreachable" | "refused" | "timeout" | "cancelled"
+
+/** Pairing could not reach the point where the TV shows its code, or a step ran out of time. */
+class PairingError extends Error {
+  constructor(
+    readonly reason: PairingErrorReason,
+    message: string,
+    readonly code?: string,
+  ) {
+    super(message)
+    this.name = "PairingError"
+  }
 }
 
-const wait = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms))
+interface PairingOptions {
+  /** The client certificate to pair; a new self-signed one is generated when absent. */
+  cert?: Certificate
+  /** Default 6467. */
+  port?: number
+  /** Shown on the TV's pairing screen. Default "androidtv-remote". */
+  serviceName?: string
+  /** This client's name, sent in the pairing request. */
+  clientName?: string
+  /** Until the TV shows its code. Default 10 s. */
+  timeoutMs?: number
+  signal?: AbortSignal
+}
 
-// Transient connect-stage failures worth retrying: a dozing TV (Wi-Fi
-// power-save) drops off the network and reports these until it wakes. Anything
-// past a live TLS session — a wrong PIN, a rejected pairing — is terminal.
-const RETRYABLE_CONNECT_CODES = new Set([
-  "EHOSTUNREACH",
-  "EHOSTDOWN",
-  "ETIMEDOUT",
-  "ECONNREFUSED",
-  "ECONNRESET",
-])
+/** A pairing in progress: the TV is showing its code. */
+interface PairingSession {
+  /** The certificate the TV pairs with; keep it, and reuse it for every remote connection. */
+  readonly certificate: Certificate
+  /** Sends the 6-character code. Rejects with PairingError (timeout, cancelled) when there is no answer. */
+  finish(code: string, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<PairingResult>
+  /** Abandons the pairing; the TV closes its code screen. */
+  cancel(): void
+}
+
+const STATUS = messages.Status as Record<string, number>
+const STATUS_OK = STATUS.STATUS_OK as number
+const STATUS_BAD_SECRET = STATUS.STATUS_BAD_SECRET as number
+
+// Transient connect-stage failures worth retrying: a dozing TV (Wi-Fi power-save) drops off the network and reports
+// these until it wakes. Anything past a live TLS session is terminal.
+const RETRYABLE_CONNECT_CODES = new Set(["EHOSTUNREACH", "EHOSTDOWN", "ETIMEDOUT", "ECONNREFUSED", "ECONNRESET"])
 const MAX_CONNECT_ATTEMPTS = 5
 const RETRY_DELAY_MS = 1000
+const DEFAULT_START_TIMEOUT_MS = 10_000
+const DEFAULT_FINISH_TIMEOUT_MS = 10_000
 
-const createPairingManager = (
-  host: string,
-  port: number,
-  certs: Certificate,
-  serviceName: string,
-): PairingManager => {
-  const emitter = new EventEmitter()
-  let client: tls.TLSSocket | undefined
-
-  const sendCode = (code: string): boolean => {
-    if (!client) return false
-    // Node types modulus/exponent as optional, but both are always present for the RSA certs used in pairing.
-    const secret = pairingSecret(
-      client.getCertificate() as unknown as RsaKey,
-      client.getPeerCertificate() as unknown as RsaKey,
-      code,
-    )
-    if (!secret) {
-      client.destroy(new Error("Bad Code"))
-      return false
-    }
-    client.write(messages.createPairingSecret(secret))
-    return true
-  }
-
-  const connectOnce = (): Promise<boolean> =>
-    new Promise((resolve, reject) => {
-      let sockError: NodeJS.ErrnoException | null = null
-      let secure = false
-
-      // `family` is a net-level lookup option that tls.connect forwards to the
-      // underlying socket; it isn't in tls.ConnectionOptions, so widen the type.
-      const options: tls.ConnectionOptions & { family?: number } = {
-        key: certs.key,
-        cert: certs.cert,
-        port,
-        host,
-        // Android TVs are reachable over IPv4 on the LAN. Pin the lookup to IPv4
-        // so a resolved hostname can't yield a scopeless IPv6 link-local address,
-        // which routes to loopback and fails EHOSTUNREACH under Happy Eyeballs.
-        family: 4,
-        rejectUnauthorized: false,
-      }
-
-      log.debug("Start Pairing Connect")
-      client = tls.connect(options, () => {
-        log.debug(host + " Pairing connected")
-      })
-
-      client.on("secureConnect", () => {
-        secure = true
-        log.debug(host + " Pairing secure connected")
-        client?.write(messages.createPairingRequest(serviceName))
-      })
-
-      const frames = createFrameReader((payload) => {
-        const message = messages.parse(payload) as unknown as PairingResponse
-
-        log.debug("Receive : " + JSON.stringify(message.toJSON()))
-
-        if (message.status !== messages.Status.STATUS_OK) {
-          client?.destroy(new Error(String(message.status)))
-        } else if (message.pairingRequestAck) {
-          client?.write(messages.createPairingOption())
-        } else if (message.pairingOption) {
-          client?.write(messages.createPairingConfiguration())
-        } else if (message.pairingConfigurationAck) {
-          emitter.emit("secret")
-        } else if (message.pairingSecretAck) {
-          log.debug(host + " Paired!")
-          client?.destroy()
-        } else {
-          log.debug(host + " What Else ?")
-        }
-      })
-
-      client.on("data", (data) => {
-        try {
-          frames.push(data)
-        } catch (error) {
-          client?.destroy(error as Error)
-        }
-      })
-
-      client.on("close", (hasError) => {
-        log.debug(host + " Pairing Connection closed", hasError)
-        if (!hasError) {
-          resolve(true)
-          return
-        }
-        // Retry only when the TLS session never came up — a transient network
-        // blink. Once `secure`, we're mid-protocol and any failure (wrong PIN,
-        // rejected pairing) must surface rather than silently reconnect.
-        const err = new Error("Pairing connection closed with error")
-        Object.assign(err, {
-          code: sockError?.code,
-          retryable:
-            !secure &&
-            sockError?.code !== undefined &&
-            RETRYABLE_CONNECT_CODES.has(sockError.code),
-        })
-        reject(err)
-      })
-
-      client.on("error", (error) => {
-        sockError = error as NodeJS.ErrnoException
-        log.error(error)
-      })
+const wait = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    const t = setTimeout(resolve, ms)
+    signal?.addEventListener("abort", () => {
+      clearTimeout(t)
+      resolve()
     })
+  })
 
-  // Ride out a dozing TV's power-save window: reconnect on transient connect
-  // failures before surfacing the friendly "could not connect" to the caller.
-  const start = async (): Promise<boolean> => {
-    for (let attempt = 1; ; attempt++) {
-      try {
-        return await connectOnce()
-      } catch (error) {
-        const { retryable, code } = error as {
-          retryable?: boolean
-          code?: string
-        }
-        if (!retryable || attempt >= MAX_CONNECT_ATTEMPTS) throw error
-        log.debug(
-          `${host} Pairing connect failed (${code}); retry ${attempt}/${MAX_CONNECT_ATTEMPTS - 1} in ${RETRY_DELAY_MS}ms`,
-        )
-        await wait(RETRY_DELAY_MS)
-      }
-    }
-  }
-
-  const stop = (): void => {
-    client?.destroy()
-  }
-
-  return Object.assign(emitter, { start, sendCode, stop })
+interface Connected {
+  socket: tls.TLSSocket
+  /** Receives every message after the code is shown. */
+  onMessage(fn: (m: PairingResponse) => void): void
 }
 
-export { createPairingManager }
-export type { PairingManager }
+/** One connection attempt, up to the code being shown. */
+const connectForCode = (
+  host: string,
+  certificate: Certificate,
+  o: { port: number; serviceName: string; clientName: string | undefined },
+  onSocket: (s: tls.TLSSocket) => void,
+) =>
+  new Promise<Connected>((resolve, reject) => {
+    let secure = false
+    let shown = false
+    let sockError: NodeJS.ErrnoException | undefined
+    let handler: ((m: PairingResponse) => void) | undefined
+    // `family` is a net-level lookup option that tls.connect forwards to the socket; pin IPv4 (see remote-manager).
+    const options: tls.ConnectionOptions & { family?: number } = {
+      key: certificate.key,
+      cert: certificate.cert,
+      port: o.port,
+      host,
+      family: 4,
+      rejectUnauthorized: false,
+    }
+    const socket = tls.connect(options)
+    onSocket(socket)
+    const frames = createFrameReader((payload) => {
+      const message = messages.parse(payload) as unknown as PairingResponse
+      log.debug("Pairing receive: " + JSON.stringify(message.toJSON()))
+      if (shown) {
+        handler?.(message)
+        return
+      }
+      if (message.status !== STATUS_OK) {
+        socket.destroy()
+        reject(new PairingError("refused", `The TV refused the pairing (status ${message.status})`))
+      } else if (message.pairingRequestAck) socket.write(messages.createPairingOption())
+      else if (message.pairingOption) socket.write(messages.createPairingConfiguration())
+      else if (message.pairingConfigurationAck) {
+        shown = true
+        resolve({ socket, onMessage: (fn) => (handler = fn) })
+      }
+    })
+    socket.on("secureConnect", () => {
+      secure = true
+      socket.write(messages.createPairingRequest(o.serviceName, o.clientName))
+    })
+    socket.on("data", (data) => {
+      try {
+        frames.push(data)
+      } catch (error) {
+        socket.destroy(error as Error)
+      }
+    })
+    socket.on("error", (error: NodeJS.ErrnoException) => {
+      sockError = error
+      log.error(error)
+    })
+    socket.on("close", () => {
+      if (shown) return
+      const code = sockError?.code
+      const error = new PairingError(
+        secure ? "refused" : "unreachable",
+        secure ? "The TV closed the pairing connection" : `Cannot reach the TV (${code ?? "closed"})`,
+        code,
+      )
+      const retryable = !secure && code !== undefined && RETRYABLE_CONNECT_CODES.has(code)
+      reject(Object.assign(error, { retryable }))
+    })
+  })
+
+/** Races `p` against a timeout and an abort signal; `onGiveUp` runs when either wins. */
+const bounded = <T>(p: Promise<T>, ms: number, signal: AbortSignal | undefined, onGiveUp: () => void): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    // `p` may still reject after we gave up on it (its socket is destroyed then): that is expected, not unhandled.
+    p.catch(() => {})
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const settle = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener("abort", onAbort)
+    }
+    const give = (error: PairingError) => {
+      settle()
+      onGiveUp()
+      reject(error)
+    }
+    const onAbort = () => give(new PairingError("cancelled", "Pairing was cancelled"))
+    if (signal?.aborted) {
+      onAbort()
+      return
+    }
+    timer = setTimeout(() => give(new PairingError("timeout", "The TV did not answer in time")), ms)
+    signal?.addEventListener("abort", onAbort, { once: true })
+    p.then(
+      (v) => {
+        settle()
+        resolve(v)
+      },
+      (e: unknown) => {
+        settle()
+        reject(e)
+      },
+    )
+  })
+
+/**
+ * Starts pairing with the TV at `host`: resolves once the TV shows its 6-character code. Rejects with PairingError:
+ * `unreachable` (no connection, after riding out a dozing TV's transient errors), `refused`, `timeout` or `cancelled`.
+ */
+const startPairing = async (host: string, options: PairingOptions = {}): Promise<PairingSession> => {
+  const certificate =
+    options.cert?.cert && options.cert.key
+      ? { cert: options.cert.cert, key: options.cert.key }
+      : generateCertificate(options.serviceName ?? "androidtv-remote", "CNT", "ST", "LOC", "O", "OU")
+  const o = {
+    port: options.port ?? 6467,
+    serviceName: options.serviceName ?? "androidtv-remote",
+    clientName: options.clientName,
+  }
+  let current: tls.TLSSocket | undefined
+  let givenUp = false
+  const attempt = async (): Promise<Connected> => {
+    for (let n = 1; ; n++) {
+      try {
+        return await connectForCode(host, certificate, o, (s) => (current = s))
+      } catch (error) {
+        const { retryable } = error as { retryable?: boolean }
+        if (!retryable || n >= MAX_CONNECT_ATTEMPTS || givenUp) throw error
+        log.debug(`${host} pairing connect failed; retry ${n}/${MAX_CONNECT_ATTEMPTS - 1}`)
+        await wait(RETRY_DELAY_MS, options.signal)
+      }
+    }
+  }
+  const connected = await bounded(attempt(), options.timeoutMs ?? DEFAULT_START_TIMEOUT_MS, options.signal, () => {
+    givenUp = true
+    current?.destroy()
+  })
+  const { socket } = connected
+  let finished = false
+
+  const finish = async (code: string, f: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<PairingResult> => {
+    if (finished || socket.destroyed) return "tv_refused"
+    finished = true
+    // Node types modulus/exponent as optional; both are present for the RSA certificates used in pairing.
+    const secret = pairingSecret(
+      socket.getCertificate() as unknown as RsaKey,
+      socket.getPeerCertificate() as unknown as RsaKey,
+      code.trim(),
+    )
+    if (!secret) {
+      socket.destroy()
+      return "wrong_code"
+    }
+    const answer = new Promise<PairingResult>((resolve) => {
+      connected.onMessage((message) => {
+        if (message.pairingSecretAck) resolve("paired")
+        else if (message.status === STATUS_BAD_SECRET) resolve("wrong_code")
+        else if (message.status !== STATUS_OK) resolve("tv_refused")
+        else return
+        socket.end()
+      })
+      socket.once("close", () => resolve("tv_refused"))
+    })
+    socket.write(messages.createPairingSecret(secret))
+    return bounded(answer, f.timeoutMs ?? DEFAULT_FINISH_TIMEOUT_MS, f.signal, () => socket.destroy())
+  }
+
+  return {
+    certificate,
+    finish,
+    cancel: () => {
+      finished = true
+      socket.destroy()
+    },
+  }
+}
+
+export { startPairing, PairingError }
+export type { PairingSession, PairingOptions, PairingResult, PairingErrorReason }

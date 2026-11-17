@@ -58,8 +58,8 @@ const createPairingSecret = (secret: number[]): Uint8Array =>
     protocolVersion: 2,
   })
 
-const parse = (buffer: Buffer): protobuf.Message =>
-  PairingMessage.decodeDelimited(buffer)
+/** Decodes one message's bytes, without its length prefix (see framing.ts). */
+const parse = (payload: Buffer): protobuf.Message => PairingMessage.decode(payload)
 
 export {
   Status,

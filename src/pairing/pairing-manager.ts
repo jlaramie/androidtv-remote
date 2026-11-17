@@ -2,6 +2,7 @@ import tls from "node:tls"
 import { createHash } from "node:crypto"
 import EventEmitter from "node:events"
 import * as messages from "./pairing-message-manager.js"
+import { createFrameReader } from "../framing.js"
 import { log } from "../logger.js"
 import type { Certificate } from "../types.js"
 
@@ -58,7 +59,6 @@ const createPairingManager = (
 ): PairingManager => {
   const emitter = new EventEmitter()
   let client: tls.TLSSocket | undefined
-  let chunks = Buffer.from([])
 
   const sendCode = (code: string): boolean => {
     log.debug("Sending code:", code)
@@ -93,7 +93,6 @@ const createPairingManager = (
 
   const connectOnce = (): Promise<boolean> =>
     new Promise((resolve, reject) => {
-      chunks = Buffer.from([])
       let sockError: NodeJS.ErrnoException | null = null
       let secure = false
 
@@ -122,30 +121,32 @@ const createPairingManager = (
         client?.write(messages.createPairingRequest(serviceName))
       })
 
+      const frames = createFrameReader((payload) => {
+        const message = messages.parse(payload) as unknown as PairingResponse
+
+        log.debug("Receive : " + JSON.stringify(message.toJSON()))
+
+        if (message.status !== messages.Status.STATUS_OK) {
+          client?.destroy(new Error(String(message.status)))
+        } else if (message.pairingRequestAck) {
+          client?.write(messages.createPairingOption())
+        } else if (message.pairingOption) {
+          client?.write(messages.createPairingConfiguration())
+        } else if (message.pairingConfigurationAck) {
+          emitter.emit("secret")
+        } else if (message.pairingSecretAck) {
+          log.debug(host + " Paired!")
+          client?.destroy()
+        } else {
+          log.debug(host + " What Else ?")
+        }
+      })
+
       client.on("data", (data) => {
-        chunks = Buffer.concat([chunks, Buffer.from(data)])
-
-        if (chunks.length > 0 && chunks.readInt8(0) === chunks.length - 1) {
-          const message = messages.parse(chunks) as unknown as PairingResponse
-
-          log.debug("Receive : " + Array.from(chunks))
-          log.debug("Receive : " + JSON.stringify(message.toJSON()))
-
-          if (message.status !== messages.Status.STATUS_OK) {
-            client?.destroy(new Error(String(message.status)))
-          } else if (message.pairingRequestAck) {
-            client?.write(messages.createPairingOption())
-          } else if (message.pairingOption) {
-            client?.write(messages.createPairingConfiguration())
-          } else if (message.pairingConfigurationAck) {
-            emitter.emit("secret")
-          } else if (message.pairingSecretAck) {
-            log.debug(host + " Paired!")
-            client?.destroy()
-          } else {
-            log.debug(host + " What Else ?")
-          }
-          chunks = Buffer.from([])
+        try {
+          frames.push(data)
+        } catch (error) {
+          client?.destroy(error as Error)
         }
       })
 

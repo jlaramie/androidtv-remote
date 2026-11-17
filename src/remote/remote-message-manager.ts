@@ -74,8 +74,8 @@ const createRemoteImeBatchEdit = (
 const createRemoteAppLinkLaunchRequest = (appLink: string): Uint8Array =>
   create({ remoteAppLinkLaunchRequest: { appLink } })
 
-const parse = (buffer: Buffer): protobuf.Message =>
-  RemoteMessage.decodeDelimited(buffer)
+/** Decodes one message's bytes, without its length prefix (see framing.ts). */
+const parse = (payload: Buffer): protobuf.Message => RemoteMessage.decode(payload)
 
 export {
   RemoteKeyCode,

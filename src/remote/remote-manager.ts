@@ -1,6 +1,7 @@
 import tls from "node:tls"
 import EventEmitter from "node:events"
 import * as messages from "./remote-message-manager.js"
+import { createFrameReader } from "../framing.js"
 import { log } from "../logger.js"
 import type { Certificate } from "../types.js"
 
@@ -44,7 +45,6 @@ const createRemoteManager = (
 ): RemoteManager => {
   const emitter = new EventEmitter()
   let client: tls.TLSSocket | undefined
-  let chunks = Buffer.from([])
   let error: NodeJS.ErrnoException | null = null
   let imeCounter = 0
   let fieldCounter = 0
@@ -81,60 +81,63 @@ const createRemoteManager = (
         resolve(true)
       })
 
+      const frames = createFrameReader((payload) => {
+        const message = messages.parse(payload) as unknown as RemoteResponse
+
+        if (!message.remotePingRequest) {
+          log.debug(host + " Receive : " + JSON.stringify(message.toJSON()))
+        }
+
+        if (message.remoteConfigure) {
+          client?.write(messages.createRemoteConfigure())
+          emitter.emit("ready")
+        } else if (message.remoteSetActive) {
+          client?.write(messages.createRemoteSetActive(622))
+        } else if (message.remotePingRequest) {
+          client?.write(
+            messages.createRemotePingResponse(message.remotePingRequest.val1),
+          )
+        } else if (message.remoteImeKeyInject) {
+          emitter.emit(
+            "current_app",
+            message.remoteImeKeyInject.appInfo.appPackage,
+          )
+        } else if (message.remoteImeBatchEdit) {
+          imeCounter = message.remoteImeBatchEdit.imeCounter
+          fieldCounter = message.remoteImeBatchEdit.fieldCounter
+        } else if (message.remoteImeShowRequest) {
+          log.debug("Receive IME SHOW REQUEST")
+        } else if (message.remoteVoiceBegin) {
+          // voice input not implemented
+        } else if (message.remoteVoicePayload) {
+          // voice input not implemented
+        } else if (message.remoteVoiceEnd) {
+          // voice input not implemented
+        } else if (message.remoteStart) {
+          emitter.emit("powered", message.remoteStart.started)
+        } else if (message.remoteSetVolumeLevel) {
+          emitter.emit("volume", {
+            level: message.remoteSetVolumeLevel.volumeLevel,
+            maximum: message.remoteSetVolumeLevel.volumeMax,
+            muted: message.remoteSetVolumeLevel.volumeMuted,
+          })
+        } else if (message.remoteSetPreferredAudioDevice) {
+          // ignored
+        } else if (message.remoteError) {
+          emitter.emit(
+            "error",
+            new Error("Remote error: " + JSON.stringify(message.remoteError)),
+          )
+        } else {
+          log.debug("What else ?")
+        }
+      })
+
       client.on("data", (data) => {
-        chunks = Buffer.concat([chunks, Buffer.from(data)])
-
-        if (chunks.length > 0 && chunks.readInt8(0) === chunks.length - 1) {
-          const message = messages.parse(chunks) as unknown as RemoteResponse
-
-          if (!message.remotePingRequest) {
-            log.debug(host + " Receive : " + JSON.stringify(message.toJSON()))
-          }
-
-          if (message.remoteConfigure) {
-            client?.write(messages.createRemoteConfigure())
-            emitter.emit("ready")
-          } else if (message.remoteSetActive) {
-            client?.write(messages.createRemoteSetActive(622))
-          } else if (message.remotePingRequest) {
-            client?.write(
-              messages.createRemotePingResponse(message.remotePingRequest.val1),
-            )
-          } else if (message.remoteImeKeyInject) {
-            emitter.emit(
-              "current_app",
-              message.remoteImeKeyInject.appInfo.appPackage,
-            )
-          } else if (message.remoteImeBatchEdit) {
-            imeCounter = message.remoteImeBatchEdit.imeCounter
-            fieldCounter = message.remoteImeBatchEdit.fieldCounter
-          } else if (message.remoteImeShowRequest) {
-            log.debug("Receive IME SHOW REQUEST")
-          } else if (message.remoteVoiceBegin) {
-            // voice input not implemented
-          } else if (message.remoteVoicePayload) {
-            // voice input not implemented
-          } else if (message.remoteVoiceEnd) {
-            // voice input not implemented
-          } else if (message.remoteStart) {
-            emitter.emit("powered", message.remoteStart.started)
-          } else if (message.remoteSetVolumeLevel) {
-            emitter.emit("volume", {
-              level: message.remoteSetVolumeLevel.volumeLevel,
-              maximum: message.remoteSetVolumeLevel.volumeMax,
-              muted: message.remoteSetVolumeLevel.volumeMuted,
-            })
-          } else if (message.remoteSetPreferredAudioDevice) {
-            // ignored
-          } else if (message.remoteError) {
-            emitter.emit(
-              "error",
-              new Error("Remote error: " + JSON.stringify(message.remoteError)),
-            )
-          } else {
-            log.debug("What else ?")
-          }
-          chunks = Buffer.from([])
+        try {
+          frames.push(data)
+        } catch (err) {
+          client?.destroy(err as Error)
         }
       })
 
